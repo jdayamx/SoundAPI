@@ -3,6 +3,59 @@ import sys
 import os
 import platform
 import shutil
+import argparse
+
+# =========================================================
+# === AUTOSTART (Windows Startup .bat) ====================
+# =========================================================
+APP_NAME = "SoundAPI"
+SCRIPT_PATH = os.path.abspath(__file__)
+PYTHON_PATH = sys.executable
+
+def get_startup_bat():
+    startup = os.path.join(
+        os.environ.get("APPDATA", ""),
+        "Microsoft", "Windows", "Start Menu", "Programs", "Startup"
+    )
+    return os.path.join(startup, f"{APP_NAME}.bat")
+
+def enable_autostart():
+    bat = get_startup_bat()
+    with open(bat, "w", encoding="utf-8") as f:
+        f.write(f'"{PYTHON_PATH}" "{SCRIPT_PATH}"\n')
+    print("✔ Автозапуск УВІМКНЕНО (Windows Startup)")
+
+def disable_autostart():
+    bat = get_startup_bat()
+    if os.path.exists(bat):
+        os.remove(bat)
+        print("✔ Автозапуск ВИМКНЕНО")
+    else:
+        print("ℹ Автозапуск вже вимкнений")
+
+def handle_autostart_args():
+    if platform.system() != "Windows":
+        return
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--autostart", choices=["on", "off"])
+    args, _ = parser.parse_known_args()
+
+    if args.autostart == "on":
+        enable_autostart()
+        sys.exit(0)
+    elif args.autostart == "off":
+        disable_autostart()
+        sys.exit(0)
+
+# ⬇ ОБРОБЛЯЄМО АРГУМЕНТИ ДО ВСЬОГО ІНШОГО
+handle_autostart_args()
+# =========================================================
+import subprocess
+import sys
+import os
+import platform
+import shutil
 
 def install_requirements():
     # 1. ПЕРЕВІРКА ТА ВСТАНОВЛЕННЯ СИСТЕМНИХ ЗАЛЕЖНОСТЕЙ (FFMPEG)
@@ -149,47 +202,55 @@ async def play(req: PlayRequest, user: str = Depends(check_auth)):
     try:
         async with httpx.AsyncClient() as client:
             res = await client.get(req.url, timeout=15.0)
-        
+
         audio = AudioSegment.from_file(io.BytesIO(res.content))
-        
-        # 1. Конвертація в масив numpy
-        samples = np.array(audio.get_array_of_samples()).astype(np.float32)
-        samples /= np.iinfo(audio.array_type).max
 
-        # 2. РЕГУЛЮВАННЯ ГУЧНОСТІ
-        # Обмежуємо значення від 0.0 до 1.0 для безпеки вух та обладнання
-        volume = max(0.0, min(1.0, req.volume))
-        samples = samples * volume 
+        raw = np.array(audio.get_array_of_samples(), dtype=np.float32)
+        raw /= np.iinfo(audio.array_type).max
 
-        if audio.channels > 1:
-            samples = samples.reshape((-1, audio.channels))
+        channels = audio.channels
 
-        # 3. Відтворення через OutputStream (як у попередньому кроці)
-        event = threading.Event()
-        
+        if channels == 1:
+            samples = raw[:, np.newaxis]   # ⬅ ЖОРСТКО робимо (N,1)
+        else:
+            samples = raw.reshape((-1, channels))
+
         def callback(outdata, frames, time, status):
             nonlocal samples
+
+            if status:
+                print(status)
+
             chunk = samples[:frames]
+            samples = samples[frames:]
+
+            # ⬇⬇⬇ АВАРІЙНИЙ ЗАХИСТ ⬇⬇⬇
+            if chunk.ndim == 1:
+                chunk = chunk[:, np.newaxis]
+
             if len(chunk) < frames:
-                outdata[:len(chunk)] = chunk
-                outdata[len(chunk):] = 0
+                outdata[:len(chunk), :] = chunk
+                outdata[len(chunk):, :] = 0
                 raise sd.CallbackStop()
             else:
-                outdata[:] = chunk
-                samples = samples[frames:]
+                outdata[:, :] = chunk
 
         stream = sd.OutputStream(
             samplerate=audio.frame_rate,
             device=req.device_id,
-            channels=audio.channels,
-            callback=callback,
-            finished_callback=lambda: event.set()
+            channels=channels,
+            dtype='float32',
+            callback=callback
         )
-        
+
         active_streams[req.device_id] = stream
         stream.start()
 
-        return {"status": "playing", "volume": volume, "duration": audio.duration_seconds}
+        return {
+            "status": "playing",
+            "volume": volume,
+            "duration": audio.duration_seconds
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
